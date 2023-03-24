@@ -35,7 +35,7 @@
 
 #include <arpa/inet.h>
 #include <signal.h>
-#include <dlfcn.h>
+#include <win_dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
 
