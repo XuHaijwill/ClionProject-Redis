@@ -132,6 +132,10 @@ set(SRC_CLI
         src/crc16.c
         src/dict.c
         src/siphash.c
+        src/cli_common.c
+        src/mt19937-64.c
+        src/monotonic.c
+        src/crcspeed.c
         )
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     # better not to work with jemalloc
