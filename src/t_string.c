@@ -78,6 +78,10 @@ static int checkStringLength(client *c, long long size, long long append) {
 #define OBJ_PXAT (1<<7)            /* Set if timestamp in ms is given */
 #define OBJ_PERSIST (1<<8)         /* Set if we need to remove the ttl */
 
+/*
+ * Noted by xhj
+ * set core method entrance
+ * */
 void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire, int unit, robj *ok_reply, robj *abort_reply) {
     long long milliseconds = 0, when = 0; /* initialized to avoid any harmness warning */
 
@@ -99,7 +103,7 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
             return;
         }
     }
-
+    // 校验:   nx 不能互斥设值， xx 需要有值
     if ((flags & OBJ_SET_NX && lookupKeyWrite(c->db,key) != NULL) ||
         (flags & OBJ_SET_XX && lookupKeyWrite(c->db,key) == NULL))
     {
@@ -110,10 +114,12 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
     if (flags & OBJ_SET_GET) {
         if (getGenericCommand(c) == C_ERR) return;
     }
-
+    //设置key value值
     genericSetKey(c,c->db,key, val,flags & OBJ_KEEPTTL,1);
     server.dirty++;
+    //对订阅了事件set的客户端进行通知
     notifyKeyspaceEvent(NOTIFY_STRING,"set",key,c->db->id);
+    //设置超时时间
     if (expire) {
         setExpire(c,c->db,key,when);
         notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);

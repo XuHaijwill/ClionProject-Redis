@@ -191,9 +191,11 @@ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
  *
  * The program is aborted if the key already exists. */
 void dbAdd(redisDb *db, robj *key, robj *val) {
+    //ptr是key字符串的内存首地址指针，将其封装成一个sds对象
     sds copy = sdsdup(key->ptr);
+    //添加key val
     int retval = dictAdd(db->dict, copy, val);
-
+    //通过宏验证是否添加成功，如果失败直接_exit(1)
     serverAssertWithInfo(NULL,key,retval == DICT_OK);
     signalKeyAsReady(db, key, val->type);
     if (server.cluster_enabled) slotToKeyAdd(key->ptr);
@@ -231,8 +233,8 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
         val->lru = old->lru;
     }
-    /* Although the key is not really deleted from the database, we regard 
-    overwrite as two steps of unlink+add, so we still need to call the unlink 
+    /* Although the key is not really deleted from the database, we regard
+    overwrite as two steps of unlink+add, so we still need to call the unlink
     callback of the module. */
     moduleNotifyKeyUnlink(key,old);
     dictSetVal(db->dict, de, val);
@@ -257,12 +259,17 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
  * The client 'c' argument may be set to NULL if the operation is performed
  * in a context where there is no clear client performing the operation. */
 void genericSetKey(client *c, redisDb *db, robj *key, robj *val, int keepttl, int signal) {
+    //当前redis中不存在要插入的key
     if (lookupKeyWrite(db,key) == NULL) {
+        //添加key val
         dbAdd(db,key,val);
     } else {
+        //覆盖key val
         dbOverwrite(db,key,val);
     }
+    //增加对val的引用计数
     incrRefCount(val);
+    //保留设置前指定key的过期时间，6.0版本之后新增的参数
     if (!keepttl) removeExpire(db,key);
     if (signal) signalModifiedKey(c,db,key);
 }
