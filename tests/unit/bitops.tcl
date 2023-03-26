@@ -1,4 +1,4 @@
-# Compare Redis commands against Tcl implementations of the same commands.
+# Compare Redis commadns against Tcl implementations of the same commands.
 proc count_bits s {
     binary scan $s b* bits
     string length [regsub -all {0} $bits {}]
@@ -41,16 +41,6 @@ proc simulate_bit_op {op args} {
 start_server {tags {"bitops"}} {
     test {BITCOUNT returns 0 against non existing key} {
         r bitcount no-key
-    } 0
-
-    test {BITCOUNT returns 0 with out of range indexes} {
-        r set str "xxxx"
-        r bitcount str 4 10
-    } 0
-
-    test {BITCOUNT returns 0 with negative indexes where start > end} {
-        r set str "xxxx"
-        r bitcount str -6 -7
     } 0
 
     catch {unset num}
@@ -98,7 +88,7 @@ start_server {tags {"bitops"}} {
     } {ERR*syntax*}
 
     test {BITCOUNT regression test for github issue #582} {
-        r del foo
+        r del str
         r setbit foo 0 1
         if {[catch {r bitcount foo 0 4294967296} e]} {
             assert_match {*ERR*out of range*} $e
@@ -348,32 +338,4 @@ start_server {tags {"bitops"}} {
             }
         }
     }
-}
-
-start_server {tags {"bitops large-memory"}} {
-    test "BIT pos larger than UINT_MAX" {
-        set bytes [expr (1 << 29) + 1]
-        set bitpos [expr (1 << 32)]
-        set oldval [lindex [r config get proto-max-bulk-len] 1]
-        r config set proto-max-bulk-len $bytes
-        r setbit mykey $bitpos 1
-        assert_equal $bytes [r strlen mykey]
-        assert_equal 1 [r getbit mykey $bitpos]
-        assert_equal [list 128 128 -1] [r bitfield mykey get u8 $bitpos set u8 $bitpos 255 get i8 $bitpos]
-        assert_equal $bitpos [r bitpos mykey 1]
-        assert_equal $bitpos [r bitpos mykey 1 [expr $bytes - 1]]
-        if {$::accurate} {
-            # set all bits to 1
-            set mega [expr (1 << 23)]
-            set part [string repeat "\xFF" $mega]
-            for {set i 0} {$i < 64} {incr i} {
-                r setrange mykey [expr $i * $mega] $part
-            }
-            r setrange mykey [expr $bytes - 1] "\xFF"
-            assert_equal [expr $bitpos + 8] [r bitcount mykey]
-            assert_equal -1 [r bitpos mykey 0 0 [expr $bytes - 1]]
-        }
-        r config set proto-max-bulk-len $oldval
-        r del mykey
-    } {1}
 }

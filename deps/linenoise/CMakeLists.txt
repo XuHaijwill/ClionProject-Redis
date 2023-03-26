@@ -1,1 +1,3 @@
-add_library(linenoise linenoise.c)
+add_library(linenoise
+        linenoise.c
+        )

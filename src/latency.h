@@ -62,9 +62,8 @@ struct latencyStats {
 };
 
 void latencyMonitorInit(void);
-void latencyAddSample(const char *event, mstime_t latency);
+void latencyAddSample(char *event, mstime_t latency);
 int THPIsEnabled(void);
-int THPDisable(void);
 
 /* Latency monitoring macros. */
 

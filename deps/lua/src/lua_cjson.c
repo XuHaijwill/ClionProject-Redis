@@ -36,7 +36,7 @@
  *       difficult to know object/array sizes ahead of time.
  */
 
-//#include <assert.h>
+#include <assert.h>
 #include <string.h>
 #include <math.h>
 #include <limits.h>
@@ -888,7 +888,7 @@ static void json_next_string_token(json_parse_t *json, json_token_t *token)
     char ch;
 
     /* Caller must ensure a string is next */
-//    assert(*json->ptr == '"');
+    assert(*json->ptr == '"');
 
     /* Skip " */
     json->ptr++;

@@ -27,96 +27,86 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "server.h"
+#include "redis.h"
 
 /*-----------------------------------------------------------------------------
  * Set Commands
  *----------------------------------------------------------------------------*/
 
-void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
-                              robj *dstkey, int op);
+void sunionDiffGenericCommand(redisClient *c, robj **setkeys, int setnum, robj *dstkey, int op);
 
 /* Factory method to return a set that *can* hold "value". When the object has
  * an integer-encodable value, an intset will be returned. Otherwise a regular
  * hash table. */
-robj *setTypeCreate(sds value) {
-    if (isSdsRepresentableAsLongLong(value,NULL) == C_OK)
+robj *setTypeCreate(robj *value) {
+    if (isObjectRepresentableAsLongLong(value,NULL) == REDIS_OK)
         return createIntsetObject();
     return createSetObject();
 }
 
-/* Add the specified value into a set.
- *
- * If the value was already member of the set, nothing is done and 0 is
- * returned, otherwise the new element is added and 1 is returned. */
-int setTypeAdd(robj *subject, sds value) {
+int setTypeAdd(robj *subject, robj *value) {
     long long llval;
-    if (subject->encoding == OBJ_ENCODING_HT) {
-        dict *ht = subject->ptr;
-        dictEntry *de = dictAddRaw(ht,value,NULL);
-        if (de) {
-            dictSetKey(ht,de,sdsdup(value));
-            dictSetVal(ht,de,NULL);
+    if (subject->encoding == REDIS_ENCODING_HT) {
+        if (dictAdd(subject->ptr,value,NULL) == DICT_OK) {
+            incrRefCount(value);
             return 1;
         }
-    } else if (subject->encoding == OBJ_ENCODING_INTSET) {
-        if (isSdsRepresentableAsLongLong(value,&llval) == C_OK) {
+    } else if (subject->encoding == REDIS_ENCODING_INTSET) {
+        if (isObjectRepresentableAsLongLong(value,&llval) == REDIS_OK) {
             uint8_t success = 0;
             subject->ptr = intsetAdd(subject->ptr,llval,&success);
             if (success) {
                 /* Convert to regular set when the intset contains
                  * too many entries. */
-                size_t max_entries = server.set_max_intset_entries;
-                /* limit to 1G entries due to intset internals. */
-                if (max_entries >= 1<<30) max_entries = 1<<30;
-                if (intsetLen(subject->ptr) > max_entries)
-                    setTypeConvert(subject,OBJ_ENCODING_HT);
+                if (intsetLen(subject->ptr) > server.set_max_intset_entries)
+                    setTypeConvert(subject,REDIS_ENCODING_HT);
                 return 1;
             }
         } else {
             /* Failed to get integer from object, convert to regular set. */
-            setTypeConvert(subject,OBJ_ENCODING_HT);
+            setTypeConvert(subject,REDIS_ENCODING_HT);
 
             /* The set *was* an intset and this value is not integer
              * encodable, so dictAdd should always work. */
-            serverAssert(dictAdd(subject->ptr,sdsdup(value),NULL) == DICT_OK);
+            redisAssertWithInfo(NULL,value,dictAdd(subject->ptr,value,NULL) == DICT_OK);
+            incrRefCount(value);
             return 1;
         }
     } else {
-        serverPanic("Unknown set encoding");
+        redisPanic("Unknown set encoding");
     }
     return 0;
 }
 
-int setTypeRemove(robj *setobj, sds value) {
+int setTypeRemove(robj *setobj, robj *value) {
     long long llval;
-    if (setobj->encoding == OBJ_ENCODING_HT) {
+    if (setobj->encoding == REDIS_ENCODING_HT) {
         if (dictDelete(setobj->ptr,value) == DICT_OK) {
             if (htNeedsResize(setobj->ptr)) dictResize(setobj->ptr);
             return 1;
         }
-    } else if (setobj->encoding == OBJ_ENCODING_INTSET) {
-        if (isSdsRepresentableAsLongLong(value,&llval) == C_OK) {
+    } else if (setobj->encoding == REDIS_ENCODING_INTSET) {
+        if (isObjectRepresentableAsLongLong(value,&llval) == REDIS_OK) {
             int success;
             setobj->ptr = intsetRemove(setobj->ptr,llval,&success);
             if (success) return 1;
         }
     } else {
-        serverPanic("Unknown set encoding");
+        redisPanic("Unknown set encoding");
     }
     return 0;
 }
 
-int setTypeIsMember(robj *subject, sds value) {
+int setTypeIsMember(robj *subject, robj *value) {
     long long llval;
-    if (subject->encoding == OBJ_ENCODING_HT) {
+    if (subject->encoding == REDIS_ENCODING_HT) {
         return dictFind((dict*)subject->ptr,value) != NULL;
-    } else if (subject->encoding == OBJ_ENCODING_INTSET) {
-        if (isSdsRepresentableAsLongLong(value,&llval) == C_OK) {
+    } else if (subject->encoding == REDIS_ENCODING_INTSET) {
+        if (isObjectRepresentableAsLongLong(value,&llval) == REDIS_OK) {
             return intsetFind((intset*)subject->ptr,llval);
         }
     } else {
-        serverPanic("Unknown set encoding");
+        redisPanic("Unknown set encoding");
     }
     return 0;
 }
@@ -125,18 +115,18 @@ setTypeIterator *setTypeInitIterator(robj *subject) {
     setTypeIterator *si = zmalloc(sizeof(setTypeIterator));
     si->subject = subject;
     si->encoding = subject->encoding;
-    if (si->encoding == OBJ_ENCODING_HT) {
+    if (si->encoding == REDIS_ENCODING_HT) {
         si->di = dictGetIterator(subject->ptr);
-    } else if (si->encoding == OBJ_ENCODING_INTSET) {
+    } else if (si->encoding == REDIS_ENCODING_INTSET) {
         si->ii = 0;
     } else {
-        serverPanic("Unknown set encoding");
+        redisPanic("Unknown set encoding");
     }
     return si;
 }
 
 void setTypeReleaseIterator(setTypeIterator *si) {
-    if (si->encoding == OBJ_ENCODING_HT)
+    if (si->encoding == REDIS_ENCODING_HT)
         dictReleaseIterator(si->di);
     zfree(si);
 }
@@ -144,60 +134,55 @@ void setTypeReleaseIterator(setTypeIterator *si) {
 /* Move to the next entry in the set. Returns the object at the current
  * position.
  *
- * Since set elements can be internally be stored as SDS strings or
+ * Since set elements can be internally be stored as redis objects or
  * simple arrays of integers, setTypeNext returns the encoding of the
  * set object you are iterating, and will populate the appropriate pointer
- * (sdsele) or (llele) accordingly.
+ * (eobj) or (llobj) accordingly.
  *
- * Note that both the sdsele and llele pointers should be passed and cannot
- * be NULL since the function will try to defensively populate the non
- * used field with values which are easy to trap if misused.
- *
- * When there are no longer elements -1 is returned. */
-int setTypeNext(setTypeIterator *si, sds *sdsele, int64_t *llele) {
-    if (si->encoding == OBJ_ENCODING_HT) {
+ * When there are no longer elements -1 is returned.
+ * Returned objects ref count is not incremented, so this function is
+ * copy on write friendly. */
+int setTypeNext(setTypeIterator *si, robj **objele, int64_t *llele) {
+    if (si->encoding == REDIS_ENCODING_HT) {
         dictEntry *de = dictNext(si->di);
         if (de == NULL) return -1;
-        *sdsele = dictGetKey(de);
-        *llele = -123456789; /* Not needed. Defensive. */
-    } else if (si->encoding == OBJ_ENCODING_INTSET) {
+        *objele = dictGetKey(de);
+    } else if (si->encoding == REDIS_ENCODING_INTSET) {
         if (!intsetGet(si->subject->ptr,si->ii++,llele))
             return -1;
-        *sdsele = NULL; /* Not needed. Defensive. */
-    } else {
-        serverPanic("Wrong set encoding in setTypeNext");
     }
     return si->encoding;
 }
 
 /* The not copy on write friendly version but easy to use version
- * of setTypeNext() is setTypeNextObject(), returning new SDS
- * strings. So if you don't retain a pointer to this object you should call
- * sdsfree() against it.
+ * of setTypeNext() is setTypeNextObject(), returning new objects
+ * or incrementing the ref count of returned objects. So if you don't
+ * retain a pointer to this object you should call decrRefCount() against it.
  *
  * This function is the way to go for write operations where COW is not
- * an issue. */
-sds setTypeNextObject(setTypeIterator *si) {
+ * an issue as the result will be anyway of incrementing the ref count. */
+robj *setTypeNextObject(setTypeIterator *si) {
     int64_t intele;
-    sds sdsele;
+    robj *objele;
     int encoding;
 
-    encoding = setTypeNext(si,&sdsele,&intele);
+    encoding = setTypeNext(si,&objele,&intele);
     switch(encoding) {
         case -1:    return NULL;
-        case OBJ_ENCODING_INTSET:
-            return sdsfromlonglong(intele);
-        case OBJ_ENCODING_HT:
-            return sdsdup(sdsele);
+        case REDIS_ENCODING_INTSET:
+            return createStringObjectFromLongLong(intele);
+        case REDIS_ENCODING_HT:
+            incrRefCount(objele);
+            return objele;
         default:
-            serverPanic("Unsupported encoding");
+            redisPanic("Unsupported encoding");
     }
     return NULL; /* just to suppress warnings */
 }
 
 /* Return random element from a non empty set.
- * The returned element can be an int64_t value if the set is encoded
- * as an "intset" blob of integers, or an SDS string if the set
+ * The returned element can be a int64_t value if the set is encoded
+ * as an "intset" blob of integers, or a redis object if the set
  * is a regular set.
  *
  * The caller provides both pointers to be populated with the right
@@ -205,30 +190,28 @@ sds setTypeNextObject(setTypeIterator *si) {
  * field of the object and is used by the caller to check if the
  * int64_t pointer or the redis object pointer was populated.
  *
- * Note that both the sdsele and llele pointers should be passed and cannot
- * be NULL since the function will try to defensively populate the non
- * used field with values which are easy to trap if misused. */
-int setTypeRandomElement(robj *setobj, sds *sdsele, int64_t *llele) {
-    if (setobj->encoding == OBJ_ENCODING_HT) {
-        dictEntry *de = dictGetFairRandomKey(setobj->ptr);
-        *sdsele = dictGetKey(de);
-        *llele = -123456789; /* Not needed. Defensive. */
-    } else if (setobj->encoding == OBJ_ENCODING_INTSET) {
+ * When an object is returned (the set was a real set) the ref count
+ * of the object is not incremented so this function can be considered
+ * copy on write friendly. */
+int setTypeRandomElement(robj *setobj, robj **objele, int64_t *llele) {
+    if (setobj->encoding == REDIS_ENCODING_HT) {
+        dictEntry *de = dictGetRandomKey(setobj->ptr);
+        *objele = dictGetKey(de);
+    } else if (setobj->encoding == REDIS_ENCODING_INTSET) {
         *llele = intsetRandom(setobj->ptr);
-        *sdsele = NULL; /* Not needed. Defensive. */
     } else {
-        serverPanic("Unknown set encoding");
+        redisPanic("Unknown set encoding");
     }
     return setobj->encoding;
 }
 
-unsigned long setTypeSize(const robj *subject) {
-    if (subject->encoding == OBJ_ENCODING_HT) {
-        return dictSize((const dict*)subject->ptr);
-    } else if (subject->encoding == OBJ_ENCODING_INTSET) {
-        return intsetLen((const intset*)subject->ptr);
+unsigned long setTypeSize(robj *subject) {
+    if (subject->encoding == REDIS_ENCODING_HT) {
+        return dictSize((dict*)subject->ptr);
+    } else if (subject->encoding == REDIS_ENCODING_INTSET) {
+        return intsetLen((intset*)subject->ptr);
     } else {
-        serverPanic("Unknown set encoding");
+        redisPanic("Unknown set encoding");
     }
 }
 
@@ -237,101 +220,69 @@ unsigned long setTypeSize(const robj *subject) {
  * set. */
 void setTypeConvert(robj *setobj, int enc) {
     setTypeIterator *si;
-    serverAssertWithInfo(NULL,setobj,setobj->type == OBJ_SET &&
-                             setobj->encoding == OBJ_ENCODING_INTSET);
+    redisAssertWithInfo(NULL,setobj,setobj->type == REDIS_SET &&
+                             setobj->encoding == REDIS_ENCODING_INTSET);
 
-    if (enc == OBJ_ENCODING_HT) {
+    if (enc == REDIS_ENCODING_HT) {
         int64_t intele;
         dict *d = dictCreate(&setDictType,NULL);
-        sds element;
+        robj *element;
 
         /* Presize the dict to avoid rehashing */
         dictExpand(d,intsetLen(setobj->ptr));
 
         /* To add the elements we extract integers and create redis objects */
         si = setTypeInitIterator(setobj);
-        while (setTypeNext(si,&element,&intele) != -1) {
-            element = sdsfromlonglong(intele);
-            serverAssert(dictAdd(d,element,NULL) == DICT_OK);
+        while (setTypeNext(si,NULL,&intele) != -1) {
+            element = createStringObjectFromLongLong(intele);
+            redisAssertWithInfo(NULL,element,dictAdd(d,element,NULL) == DICT_OK);
         }
         setTypeReleaseIterator(si);
 
-        setobj->encoding = OBJ_ENCODING_HT;
+        setobj->encoding = REDIS_ENCODING_HT;
         zfree(setobj->ptr);
         setobj->ptr = d;
     } else {
-        serverPanic("Unsupported set conversion");
+        redisPanic("Unsupported set conversion");
     }
 }
 
-/* This is a helper function for the COPY command.
- * Duplicate a set object, with the guarantee that the returned object
- * has the same encoding as the original one.
- *
- * The resulting object always has refcount set to 1 */
-robj *setTypeDup(robj *o) {
-    robj *set;
-    setTypeIterator *si;
-    sds elesds;
-    int64_t intobj;
-
-    serverAssert(o->type == OBJ_SET);
-
-    /* Create a new set object that have the same encoding as the original object's encoding */
-    if (o->encoding == OBJ_ENCODING_INTSET) {
-        intset *is = o->ptr;
-        size_t size = intsetBlobLen(is);
-        intset *newis = zmalloc(size);
-        memcpy(newis,is,size);
-        set = createObject(OBJ_SET, newis);
-        set->encoding = OBJ_ENCODING_INTSET;
-    } else if (o->encoding == OBJ_ENCODING_HT) {
-        set = createSetObject();
-        dict *d = o->ptr;
-        dictExpand(set->ptr, dictSize(d));
-        si = setTypeInitIterator(o);
-        while (setTypeNext(si, &elesds, &intobj) != -1) {
-            setTypeAdd(set, elesds);
-        }
-        setTypeReleaseIterator(si);
-    } else {
-        serverPanic("Unknown set encoding");
-    }
-    return set;
-}
-
-void saddCommand(client *c) {
+void saddCommand(redisClient *c) {
     robj *set;
     int j, added = 0;
 
     set = lookupKeyWrite(c->db,c->argv[1]);
-    if (checkType(c,set,OBJ_SET)) return;
-    
     if (set == NULL) {
-        set = setTypeCreate(c->argv[2]->ptr);
+        set = setTypeCreate(c->argv[2]);
         dbAdd(c->db,c->argv[1],set);
+    } else {
+        if (set->type != REDIS_SET) {
+            addReply(c,shared.wrongtypeerr);
+            return;
+        }
     }
 
     for (j = 2; j < c->argc; j++) {
-        if (setTypeAdd(set,c->argv[j]->ptr)) added++;
+        c->argv[j] = tryObjectEncoding(c->argv[j]);
+        if (setTypeAdd(set,c->argv[j])) added++;
     }
     if (added) {
-        signalModifiedKey(c,c->db,c->argv[1]);
-        notifyKeyspaceEvent(NOTIFY_SET,"sadd",c->argv[1],c->db->id);
+        signalModifiedKey(c->db,c->argv[1]);
+        notifyKeyspaceEvent(REDIS_NOTIFY_SET,"sadd",c->argv[1],c->db->id);
     }
     server.dirty += added;
     addReplyLongLong(c,added);
 }
 
-void sremCommand(client *c) {
+void sremCommand(redisClient *c) {
     robj *set;
     int j, deleted = 0, keyremoved = 0;
 
     if ((set = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL ||
-        checkType(c,set,OBJ_SET)) return;
+        checkType(c,set,REDIS_SET)) return;
 
     for (j = 2; j < c->argc; j++) {
-        if (setTypeRemove(set,c->argv[j]->ptr)) {
+        if (setTypeRemove(set,c->argv[j])) {
             deleted++;
             if (setTypeSize(set) == 0) {
                 dbDelete(c->db,c->argv[1]);
@@ -341,21 +292,21 @@ void sremCommand(client *c) {
         }
     }
     if (deleted) {
-        signalModifiedKey(c,c->db,c->argv[1]);
-        notifyKeyspaceEvent(NOTIFY_SET,"srem",c->argv[1],c->db->id);
+        signalModifiedKey(c->db,c->argv[1]);
+        notifyKeyspaceEvent(REDIS_NOTIFY_SET,"srem",c->argv[1],c->db->id);
         if (keyremoved)
-            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",c->argv[1],
+            notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",c->argv[1],
                                 c->db->id);
         server.dirty += deleted;
     }
     addReplyLongLong(c,deleted);
 }
 
-void smoveCommand(client *c) {
+void smoveCommand(redisClient *c) {
     robj *srcset, *dstset, *ele;
     srcset = lookupKeyWrite(c->db,c->argv[1]);
     dstset = lookupKeyWrite(c->db,c->argv[2]);
-    ele = c->argv[3];
+    ele = c->argv[3] = tryObjectEncoding(c->argv[3]);
 
     /* If the source key does not exist return 0 */
     if (srcset == NULL) {
@@ -365,286 +316,97 @@ void smoveCommand(client *c) {
 
     /* If the source key has the wrong type, or the destination key
      * is set and has the wrong type, return with an error. */
-    if (checkType(c,srcset,OBJ_SET) ||
-        checkType(c,dstset,OBJ_SET)) return;
+    if (checkType(c,srcset,REDIS_SET) ||
+        (dstset && checkType(c,dstset,REDIS_SET))) return;
 
     /* If srcset and dstset are equal, SMOVE is a no-op */
     if (srcset == dstset) {
-        addReply(c,setTypeIsMember(srcset,ele->ptr) ?
-            shared.cone : shared.czero);
+        addReply(c,setTypeIsMember(srcset,ele) ? shared.cone : shared.czero);
         return;
     }
 
     /* If the element cannot be removed from the src set, return 0. */
-    if (!setTypeRemove(srcset,ele->ptr)) {
+    if (!setTypeRemove(srcset,ele)) {
         addReply(c,shared.czero);
         return;
     }
-    notifyKeyspaceEvent(NOTIFY_SET,"srem",c->argv[1],c->db->id);
+    notifyKeyspaceEvent(REDIS_NOTIFY_SET,"srem",c->argv[1],c->db->id);
 
     /* Remove the src set from the database when empty */
     if (setTypeSize(srcset) == 0) {
         dbDelete(c->db,c->argv[1]);
-        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",c->argv[1],c->db->id);
+        notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",c->argv[1],c->db->id);
     }
+    signalModifiedKey(c->db,c->argv[1]);
+    signalModifiedKey(c->db,c->argv[2]);
+    server.dirty++;
 
     /* Create the destination set when it doesn't exist */
     if (!dstset) {
-        dstset = setTypeCreate(ele->ptr);
+        dstset = setTypeCreate(ele);
         dbAdd(c->db,c->argv[2],dstset);
     }
 
-    signalModifiedKey(c,c->db,c->argv[1]);
-    server.dirty++;
-
     /* An extra key has changed when ele was successfully added to dstset */
-    if (setTypeAdd(dstset,ele->ptr)) {
+    if (setTypeAdd(dstset,ele)) {
         server.dirty++;
-        signalModifiedKey(c,c->db,c->argv[2]);
-        notifyKeyspaceEvent(NOTIFY_SET,"sadd",c->argv[2],c->db->id);
+        notifyKeyspaceEvent(REDIS_NOTIFY_SET,"sadd",c->argv[2],c->db->id);
     }
     addReply(c,shared.cone);
 }
 
-void sismemberCommand(client *c) {
+void sismemberCommand(redisClient *c) {
     robj *set;
 
     if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
-        checkType(c,set,OBJ_SET)) return;
+        checkType(c,set,REDIS_SET)) return;
 
-    if (setTypeIsMember(set,c->argv[2]->ptr))
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
+    if (setTypeIsMember(set,c->argv[2]))
         addReply(c,shared.cone);
     else
         addReply(c,shared.czero);
 }
 
-void smismemberCommand(client *c) {
-    robj *set;
-    int j;
-
-    /* Don't abort when the key cannot be found. Non-existing keys are empty
-     * sets, where SMISMEMBER should respond with a series of zeros. */
-    set = lookupKeyRead(c->db,c->argv[1]);
-    if (set && checkType(c,set,OBJ_SET)) return;
-
-    addReplyArrayLen(c,c->argc - 2);
-
-    for (j = 2; j < c->argc; j++) {
-        if (set && setTypeIsMember(set,c->argv[j]->ptr))
-            addReply(c,shared.cone);
-        else
-            addReply(c,shared.czero);
-    }
-}
-
-void scardCommand(client *c) {
+void scardCommand(redisClient *c) {
     robj *o;
 
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
-        checkType(c,o,OBJ_SET)) return;
+        checkType(c,o,REDIS_SET)) return;
 
     addReplyLongLong(c,setTypeSize(o));
 }
 
-/* Handle the "SPOP key <count>" variant. The normal version of the
- * command is handled by the spopCommand() function itself. */
-
-/* How many times bigger should be the set compared to the remaining size
- * for us to use the "create new set" strategy? Read later in the
- * implementation for more info. */
-#define SPOP_MOVE_STRATEGY_MUL 5
-
-void spopWithCountCommand(client *c) {
-    long l;
-    unsigned long count, size;
-    robj *set;
-
-    /* Get the count argument */
-    if (getPositiveLongFromObjectOrReply(c,c->argv[2],&l,NULL) != C_OK) return;
-    count = (unsigned long) l;
-
-    /* Make sure a key with the name inputted exists, and that it's type is
-     * indeed a set. Otherwise, return nil */
-    if ((set = lookupKeyWriteOrReply(c,c->argv[1],shared.emptyset[c->resp]))
-        == NULL || checkType(c,set,OBJ_SET)) return;
-
-    /* If count is zero, serve an empty set ASAP to avoid special
-     * cases later. */
-    if (count == 0) {
-        addReply(c,shared.emptyset[c->resp]);
-        return;
-    }
-
-    size = setTypeSize(set);
-
-    /* Generate an SPOP keyspace notification */
-    notifyKeyspaceEvent(NOTIFY_SET,"spop",c->argv[1],c->db->id);
-    server.dirty += (count >= size) ? size : count;
-
-    /* CASE 1:
-     * The number of requested elements is greater than or equal to
-     * the number of elements inside the set: simply return the whole set. */
-    if (count >= size) {
-        /* We just return the entire set */
-        sunionDiffGenericCommand(c,c->argv+1,1,NULL,SET_OP_UNION);
-
-        /* Delete the set as it is now empty */
-        dbDelete(c->db,c->argv[1]);
-        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",c->argv[1],c->db->id);
-
-        /* Propagate this command as a DEL operation */
-        rewriteClientCommandVector(c,2,shared.del,c->argv[1]);
-        signalModifiedKey(c,c->db,c->argv[1]);
-        return;
-    }
-
-    /* Case 2 and 3 require to replicate SPOP as a set of SREM commands.
-     * Prepare our replication argument vector. Also send the array length
-     * which is common to both the code paths. */
-    robj *propargv[3];
-    propargv[0] = shared.srem;
-    propargv[1] = c->argv[1];
-    addReplySetLen(c,count);
-
-    /* Common iteration vars. */
-    sds sdsele;
-    robj *objele;
-    int encoding;
-    int64_t llele;
-    unsigned long remaining = size-count; /* Elements left after SPOP. */
-
-    /* If we are here, the number of requested elements is less than the
-     * number of elements inside the set. Also we are sure that count < size.
-     * Use two different strategies.
-     *
-     * CASE 2: The number of elements to return is small compared to the
-     * set size. We can just extract random elements and return them to
-     * the set. */
-    if (remaining*SPOP_MOVE_STRATEGY_MUL > count) {
-        while(count--) {
-            /* Emit and remove. */
-            encoding = setTypeRandomElement(set,&sdsele,&llele);
-            if (encoding == OBJ_ENCODING_INTSET) {
-                addReplyBulkLongLong(c,llele);
-                objele = createStringObjectFromLongLong(llele);
-                set->ptr = intsetRemove(set->ptr,llele,NULL);
-            } else {
-                addReplyBulkCBuffer(c,sdsele,sdslen(sdsele));
-                objele = createStringObject(sdsele,sdslen(sdsele));
-                setTypeRemove(set,sdsele);
-            }
-
-            /* Replicate/AOF this command as an SREM operation */
-            propargv[2] = objele;
-            alsoPropagate(server.sremCommand,c->db->id,propargv,3,
-                PROPAGATE_AOF|PROPAGATE_REPL);
-            decrRefCount(objele);
-        }
-    } else {
-    /* CASE 3: The number of elements to return is very big, approaching
-     * the size of the set itself. After some time extracting random elements
-     * from such a set becomes computationally expensive, so we use
-     * a different strategy, we extract random elements that we don't
-     * want to return (the elements that will remain part of the set),
-     * creating a new set as we do this (that will be stored as the original
-     * set). Then we return the elements left in the original set and
-     * release it. */
-        robj *newset = NULL;
-
-        /* Create a new set with just the remaining elements. */
-        while(remaining--) {
-            encoding = setTypeRandomElement(set,&sdsele,&llele);
-            if (encoding == OBJ_ENCODING_INTSET) {
-                sdsele = sdsfromlonglong(llele);
-            } else {
-                sdsele = sdsdup(sdsele);
-            }
-            if (!newset) newset = setTypeCreate(sdsele);
-            setTypeAdd(newset,sdsele);
-            setTypeRemove(set,sdsele);
-            sdsfree(sdsele);
-        }
-
-        /* Transfer the old set to the client. */
-        setTypeIterator *si;
-        si = setTypeInitIterator(set);
-        while((encoding = setTypeNext(si,&sdsele,&llele)) != -1) {
-            if (encoding == OBJ_ENCODING_INTSET) {
-                addReplyBulkLongLong(c,llele);
-                objele = createStringObjectFromLongLong(llele);
-            } else {
-                addReplyBulkCBuffer(c,sdsele,sdslen(sdsele));
-                objele = createStringObject(sdsele,sdslen(sdsele));
-            }
-
-            /* Replicate/AOF this command as an SREM operation */
-            propargv[2] = objele;
-            alsoPropagate(server.sremCommand,c->db->id,propargv,3,
-                PROPAGATE_AOF|PROPAGATE_REPL);
-            decrRefCount(objele);
-        }
-        setTypeReleaseIterator(si);
-
-        /* Assign the new set as the key value. */
-        dbOverwrite(c->db,c->argv[1],newset);
-    }
-
-    /* Don't propagate the command itself even if we incremented the
-     * dirty counter. We don't want to propagate an SPOP command since
-     * we propagated the command as a set of SREMs operations using
-     * the alsoPropagate() API. */
-    preventCommandPropagation(c);
-    signalModifiedKey(c,c->db,c->argv[1]);
-}
-
-void spopCommand(client *c) {
-    robj *set, *ele;
-    sds sdsele;
+void spopCommand(redisClient *c) {
+    robj *set, *ele, *aux;
     int64_t llele;
     int encoding;
 
-    if (c->argc == 3) {
-        spopWithCountCommand(c);
-        return;
-    } else if (c->argc > 3) {
-        addReplyErrorObject(c,shared.syntaxerr);
-        return;
-    }
+    if ((set = lookupKeyWriteOrReply(c,c->argv[1],shared.nullbulk)) == NULL ||
+        checkType(c,set,REDIS_SET)) return;
 
-    /* Make sure a key with the name inputted exists, and that it's type is
-     * indeed a set */
-    if ((set = lookupKeyWriteOrReply(c,c->argv[1],shared.null[c->resp]))
-         == NULL || checkType(c,set,OBJ_SET)) return;
-
-    /* Get a random element from the set */
-    encoding = setTypeRandomElement(set,&sdsele,&llele);
-
-    /* Remove the element from the set */
-    if (encoding == OBJ_ENCODING_INTSET) {
+    encoding = setTypeRandomElement(set,&ele,&llele);
+    if (encoding == REDIS_ENCODING_INTSET) {
         ele = createStringObjectFromLongLong(llele);
         set->ptr = intsetRemove(set->ptr,llele,NULL);
     } else {
-        ele = createStringObject(sdsele,sdslen(sdsele));
-        setTypeRemove(set,ele->ptr);
+        incrRefCount(ele);
+        setTypeRemove(set,ele);
     }
-
-    notifyKeyspaceEvent(NOTIFY_SET,"spop",c->argv[1],c->db->id);
+    notifyKeyspaceEvent(REDIS_NOTIFY_SET,"spop",c->argv[1],c->db->id);
 
     /* Replicate/AOF this command as an SREM operation */
-    rewriteClientCommandVector(c,3,shared.srem,c->argv[1],ele);
-
-    /* Add the element to the reply */
-    addReplyBulk(c,ele);
+    aux = createStringObject("SREM",4);
+    rewriteClientCommandVector(c,3,aux,c->argv[1],ele);
     decrRefCount(ele);
+    decrRefCount(aux);
 
-    /* Delete the set if it's empty */
+    addReplyBulk(c,ele);
     if (setTypeSize(set) == 0) {
         dbDelete(c->db,c->argv[1]);
-        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",c->argv[1],c->db->id);
+        notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",c->argv[1],c->db->id);
     }
-
-    /* Set has been modified */
-    signalModifiedKey(c,c->db,c->argv[1]);
+    signalModifiedKey(c->db,c->argv[1]);
     server.dirty++;
 }
 
@@ -656,20 +418,19 @@ void spopCommand(client *c) {
  * implementation for more info. */
 #define SRANDMEMBER_SUB_STRATEGY_MUL 3
 
-void srandmemberWithCountCommand(client *c) {
+void srandmemberWithCountCommand(redisClient *c) {
     long l;
     unsigned long count, size;
     int uniq = 1;
-    robj *set;
-    sds ele;
+    robj *set, *ele;
     int64_t llele;
     int encoding;
 
     dict *d;
 
-    if (getRangeLongFromObjectOrReply(c,c->argv[2],-LONG_MAX,LONG_MAX,&l,NULL) != C_OK) return;
+    if (getLongFromObjectOrReply(c,c->argv[2],&l,NULL) != REDIS_OK) return;
     if (l >= 0) {
-        count = (unsigned long) l;
+        count = (unsigned) l;
     } else {
         /* A negative count means: return the same elements multiple times
          * (i.e. don't remove the extracted element after every extraction). */
@@ -677,32 +438,29 @@ void srandmemberWithCountCommand(client *c) {
         uniq = 0;
     }
 
-    if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.emptyarray))
-        == NULL || checkType(c,set,OBJ_SET)) return;
+    if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.emptymultibulk))
+        == NULL || checkType(c,set,REDIS_SET)) return;
     size = setTypeSize(set);
 
     /* If count is zero, serve it ASAP to avoid special cases later. */
     if (count == 0) {
-        addReply(c,shared.emptyarray);
+        addReply(c,shared.emptymultibulk);
         return;
     }
 
     /* CASE 1: The count was negative, so the extraction method is just:
      * "return N random elements" sampling the whole set every time.
      * This case is trivial and can be served without auxiliary data
-     * structures. This case is the only one that also needs to return the
-     * elements in random order. */
-    if (!uniq || count == 1) {
-        addReplyArrayLen(c,count);
+     * structures. */
+    if (!uniq) {
+        addReplyMultiBulkLen(c,count);
         while(count--) {
             encoding = setTypeRandomElement(set,&ele,&llele);
-            if (encoding == OBJ_ENCODING_INTSET) {
+            if (encoding == REDIS_ENCODING_INTSET) {
                 addReplyBulkLongLong(c,llele);
             } else {
-                addReplyBulkCBuffer(c,ele,sdslen(ele));
+                addReplyBulk(c,ele);
             }
-            if (c->flags & CLIENT_CLOSE_ASAP)
-                break;
         }
         return;
     }
@@ -711,24 +469,12 @@ void srandmemberWithCountCommand(client *c) {
      * The number of requested elements is greater than the number of
      * elements inside the set: simply return the whole set. */
     if (count >= size) {
-        setTypeIterator *si;
-        addReplyArrayLen(c,size);
-        si = setTypeInitIterator(set);
-        while ((encoding = setTypeNext(si,&ele,&llele)) != -1) {
-            if (encoding == OBJ_ENCODING_INTSET) {
-                addReplyBulkLongLong(c,llele);
-            } else {
-                addReplyBulkCBuffer(c,ele,sdslen(ele));
-            }
-            size--;
-        }
-        setTypeReleaseIterator(si);
-        serverAssert(size==0);
+        sunionDiffGenericCommand(c,c->argv+1,1,NULL,REDIS_OP_UNION);
         return;
     }
 
     /* For CASE 3 and CASE 4 we need an auxiliary dictionary. */
-    d = dictCreate(&sdsReplyDictType,NULL);
+    d = dictCreate(&setDictType,NULL);
 
     /* CASE 3:
      * The number of elements inside the set is not greater than
@@ -736,35 +482,33 @@ void srandmemberWithCountCommand(client *c) {
      * In this case we create a set from scratch with all the elements, and
      * subtract random elements to reach the requested number of elements.
      *
-     * This is done because if the number of requested elements is just
+     * This is done because if the number of requsted elements is just
      * a bit less than the number of elements in the set, the natural approach
-     * used into CASE 4 is highly inefficient. */
+     * used into CASE 3 is highly inefficient. */
     if (count*SRANDMEMBER_SUB_STRATEGY_MUL > size) {
         setTypeIterator *si;
 
         /* Add all the elements into the temporary dictionary. */
         si = setTypeInitIterator(set);
-        dictExpand(d, size);
-        while ((encoding = setTypeNext(si,&ele,&llele)) != -1) {
+        while((encoding = setTypeNext(si,&ele,&llele)) != -1) {
             int retval = DICT_ERR;
 
-            if (encoding == OBJ_ENCODING_INTSET) {
-                retval = dictAdd(d,sdsfromlonglong(llele),NULL);
+            if (encoding == REDIS_ENCODING_INTSET) {
+                retval = dictAdd(d,createStringObjectFromLongLong(llele),NULL);
             } else {
-                retval = dictAdd(d,sdsdup(ele),NULL);
+                retval = dictAdd(d,dupStringObject(ele),NULL);
             }
-            serverAssert(retval == DICT_OK);
+            redisAssert(retval == DICT_OK);
         }
         setTypeReleaseIterator(si);
-        serverAssert(dictSize(d) == size);
+        redisAssert(dictSize(d) == size);
 
         /* Remove random elements to reach the right count. */
-        while (size > count) {
+        while(size > count) {
             dictEntry *de;
+
             de = dictGetRandomKey(d);
-            dictUnlink(d,dictGetKey(de));
-            sdsfree(dictGetKey(de));
-            dictFreeUnlinkedEntry(d,de);
+            dictDelete(d,dictGetKey(de));
             size--;
         }
     }
@@ -775,23 +519,21 @@ void srandmemberWithCountCommand(client *c) {
      * to reach the specified count. */
     else {
         unsigned long added = 0;
-        sds sdsele;
 
-        dictExpand(d, count);
-        while (added < count) {
+        while(added < count) {
             encoding = setTypeRandomElement(set,&ele,&llele);
-            if (encoding == OBJ_ENCODING_INTSET) {
-                sdsele = sdsfromlonglong(llele);
+            if (encoding == REDIS_ENCODING_INTSET) {
+                ele = createStringObjectFromLongLong(llele);
             } else {
-                sdsele = sdsdup(ele);
+                ele = dupStringObject(ele);
             }
             /* Try to add the object to the dictionary. If it already exists
              * free it, otherwise increment the number of objects we have
              * in the result dictionary. */
-            if (dictAdd(d,sdsele,NULL) == DICT_OK)
+            if (dictAdd(d,ele,NULL) == DICT_OK)
                 added++;
             else
-                sdsfree(sdsele);
+                decrRefCount(ele);
         }
     }
 
@@ -800,19 +542,17 @@ void srandmemberWithCountCommand(client *c) {
         dictIterator *di;
         dictEntry *de;
 
-        addReplyArrayLen(c,count);
+        addReplyMultiBulkLen(c,count);
         di = dictGetIterator(d);
         while((de = dictNext(di)) != NULL)
-            addReplyBulkSds(c,dictGetKey(de));
+            addReplyBulk(c,dictGetKey(de));
         dictReleaseIterator(di);
         dictRelease(d);
     }
 }
 
-/* SRANDMEMBER [<count>] */
-void srandmemberCommand(client *c) {
-    robj *set;
-    sds ele;
+void srandmemberCommand(redisClient *c) {
+    robj *set, *ele;
     int64_t llele;
     int encoding;
 
@@ -820,85 +560,65 @@ void srandmemberCommand(client *c) {
         srandmemberWithCountCommand(c);
         return;
     } else if (c->argc > 3) {
-        addReplyErrorObject(c,shared.syntaxerr);
+        addReply(c,shared.syntaxerr);
         return;
     }
 
-    /* Handle variant without <count> argument. Reply with simple bulk string */
-    if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp]))
-        == NULL || checkType(c,set,OBJ_SET)) return;
+    if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.nullbulk)) == NULL ||
+        checkType(c,set,REDIS_SET)) return;
 
     encoding = setTypeRandomElement(set,&ele,&llele);
-    if (encoding == OBJ_ENCODING_INTSET) {
+    if (encoding == REDIS_ENCODING_INTSET) {
         addReplyBulkLongLong(c,llele);
     } else {
-        addReplyBulkCBuffer(c,ele,sdslen(ele));
+        addReplyBulk(c,ele);
     }
 }
 
 int qsortCompareSetsByCardinality(const void *s1, const void *s2) {
-    if (setTypeSize(*(robj**)s1) > setTypeSize(*(robj**)s2)) return 1;
-    if (setTypeSize(*(robj**)s1) < setTypeSize(*(robj**)s2)) return -1;
-    return 0;
+    return setTypeSize(*(robj**)s1)-setTypeSize(*(robj**)s2);
 }
 
 /* This is used by SDIFF and in this case we can receive NULL that should
  * be handled as empty sets. */
 int qsortCompareSetsByRevCardinality(const void *s1, const void *s2) {
     robj *o1 = *(robj**)s1, *o2 = *(robj**)s2;
-    unsigned long first = o1 ? setTypeSize(o1) : 0;
-    unsigned long second = o2 ? setTypeSize(o2) : 0;
 
-    if (first < second) return 1;
-    if (first > second) return -1;
-    return 0;
+    return  (o2 ? setTypeSize(o2) : 0) - (o1 ? setTypeSize(o1) : 0);
 }
 
-void sinterGenericCommand(client *c, robj **setkeys,
-                          unsigned long setnum, robj *dstkey) {
+void sinterGenericCommand(redisClient *c, robj **setkeys, unsigned long setnum, robj *dstkey) {
     robj **sets = zmalloc(sizeof(robj*)*setnum);
     setTypeIterator *si;
-    robj *dstset = NULL;
-    sds elesds;
+    robj *eleobj, *dstset = NULL;
     int64_t intobj;
     void *replylen = NULL;
     unsigned long j, cardinality = 0;
-    int encoding, empty = 0;
+    int encoding;
 
     for (j = 0; j < setnum; j++) {
         robj *setobj = dstkey ?
             lookupKeyWrite(c->db,setkeys[j]) :
             lookupKeyRead(c->db,setkeys[j]);
         if (!setobj) {
-            /* A NULL is considered an empty set */
-            empty += 1;
-            sets[j] = NULL;
-            continue;
+            zfree(sets);
+            if (dstkey) {
+                if (dbDelete(c->db,dstkey)) {
+                    signalModifiedKey(c->db,dstkey);
+                    server.dirty++;
+                }
+                addReply(c,shared.czero);
+            } else {
+                addReply(c,shared.emptymultibulk);
+            }
+            return;
         }
-        if (checkType(c,setobj,OBJ_SET)) {
+        if (checkType(c,setobj,REDIS_SET)) {
             zfree(sets);
             return;
         }
         sets[j] = setobj;
     }
-
-    /* Set intersection with an empty set always results in an empty set.
-     * Return ASAP if there is an empty set. */
-    if (empty > 0) {
-        zfree(sets);
-        if (dstkey) {
-            if (dbDelete(c->db,dstkey)) {
-                signalModifiedKey(c,c->db,dstkey);
-                notifyKeyspaceEvent(NOTIFY_GENERIC,"del",dstkey,c->db->id);
-                server.dirty++;
-            }
-            addReply(c,shared.czero);
-        } else {
-            addReply(c,shared.emptyset[c->resp]);
-        }
-        return;
-    }
-
     /* Sort sets from the smallest to largest, this will improve our
      * algorithm's performance */
     qsort(sets,setnum,sizeof(robj*),qsortCompareSetsByCardinality);
@@ -909,7 +629,7 @@ void sinterGenericCommand(client *c, robj **setkeys,
      * to the output list and save the pointer to later modify it with the
      * right length */
     if (!dstkey) {
-        replylen = addReplyDeferredLen(c);
+        replylen = addDeferredMultiBulkLength(c);
     } else {
         /* If we have a target key where to store the resulting set
          * create this key with an empty set inside */
@@ -920,28 +640,38 @@ void sinterGenericCommand(client *c, robj **setkeys,
      * the element against all the other sets, if at least one set does
      * not include the element it is discarded */
     si = setTypeInitIterator(sets[0]);
-    while((encoding = setTypeNext(si,&elesds,&intobj)) != -1) {
+    while((encoding = setTypeNext(si,&eleobj,&intobj)) != -1) {
         for (j = 1; j < setnum; j++) {
             if (sets[j] == sets[0]) continue;
-            if (encoding == OBJ_ENCODING_INTSET) {
+            if (encoding == REDIS_ENCODING_INTSET) {
                 /* intset with intset is simple... and fast */
-                if (sets[j]->encoding == OBJ_ENCODING_INTSET &&
+                if (sets[j]->encoding == REDIS_ENCODING_INTSET &&
                     !intsetFind((intset*)sets[j]->ptr,intobj))
                 {
                     break;
                 /* in order to compare an integer with an object we
                  * have to use the generic function, creating an object
                  * for this */
-                } else if (sets[j]->encoding == OBJ_ENCODING_HT) {
-                    elesds = sdsfromlonglong(intobj);
-                    if (!setTypeIsMember(sets[j],elesds)) {
-                        sdsfree(elesds);
+                } else if (sets[j]->encoding == REDIS_ENCODING_HT) {
+                    eleobj = createStringObjectFromLongLong(intobj);
+                    if (!setTypeIsMember(sets[j],eleobj)) {
+                        decrRefCount(eleobj);
                         break;
                     }
-                    sdsfree(elesds);
+                    decrRefCount(eleobj);
                 }
-            } else if (encoding == OBJ_ENCODING_HT) {
-                if (!setTypeIsMember(sets[j],elesds)) {
+            } else if (encoding == REDIS_ENCODING_HT) {
+                /* Optimization... if the source object is integer
+                 * encoded AND the target set is an intset, we can get
+                 * a much faster path. */
+                if (eleobj->encoding == REDIS_ENCODING_INT &&
+                    sets[j]->encoding == REDIS_ENCODING_INTSET &&
+                    !intsetFind((intset*)sets[j]->ptr,(long)eleobj->ptr))
+                {
+                    break;
+                /* else... object to object check is easy as we use the
+                 * type agnostic API here. */
+                } else if (!setTypeIsMember(sets[j],eleobj)) {
                     break;
                 }
             }
@@ -950,18 +680,18 @@ void sinterGenericCommand(client *c, robj **setkeys,
         /* Only take action when all sets contain the member */
         if (j == setnum) {
             if (!dstkey) {
-                if (encoding == OBJ_ENCODING_HT)
-                    addReplyBulkCBuffer(c,elesds,sdslen(elesds));
+                if (encoding == REDIS_ENCODING_HT)
+                    addReplyBulk(c,eleobj);
                 else
                     addReplyBulkLongLong(c,intobj);
                 cardinality++;
             } else {
-                if (encoding == OBJ_ENCODING_INTSET) {
-                    elesds = sdsfromlonglong(intobj);
-                    setTypeAdd(dstset,elesds);
-                    sdsfree(elesds);
+                if (encoding == REDIS_ENCODING_INTSET) {
+                    eleobj = createStringObjectFromLongLong(intobj);
+                    setTypeAdd(dstset,eleobj);
+                    decrRefCount(eleobj);
                 } else {
-                    setTypeAdd(dstset,elesds);
+                    setTypeAdd(dstset,eleobj);
                 }
             }
         }
@@ -971,47 +701,43 @@ void sinterGenericCommand(client *c, robj **setkeys,
     if (dstkey) {
         /* Store the resulting set into the target, if the intersection
          * is not an empty set. */
+        int deleted = dbDelete(c->db,dstkey);
         if (setTypeSize(dstset) > 0) {
-            setKey(c,c->db,dstkey,dstset);
+            dbAdd(c->db,dstkey,dstset);
             addReplyLongLong(c,setTypeSize(dstset));
-            notifyKeyspaceEvent(NOTIFY_SET,"sinterstore",
+            notifyKeyspaceEvent(REDIS_NOTIFY_SET,"sinterstore",
                 dstkey,c->db->id);
-            server.dirty++;
         } else {
+            decrRefCount(dstset);
             addReply(c,shared.czero);
-            if (dbDelete(c->db,dstkey)) {
-                server.dirty++;
-                signalModifiedKey(c,c->db,dstkey);
-                notifyKeyspaceEvent(NOTIFY_GENERIC,"del",dstkey,c->db->id);
-            }
+            if (deleted)
+                notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",
+                    dstkey,c->db->id);
         }
-        decrRefCount(dstset);
+        signalModifiedKey(c->db,dstkey);
+        server.dirty++;
     } else {
-        setDeferredSetLen(c,replylen,cardinality);
+        setDeferredMultiBulkLength(c,replylen,cardinality);
     }
     zfree(sets);
 }
 
-/* SINTER key [key ...] */
-void sinterCommand(client *c) {
+void sinterCommand(redisClient *c) {
     sinterGenericCommand(c,c->argv+1,c->argc-1,NULL);
 }
 
-/* SINTERSTORE destination key [key ...] */
-void sinterstoreCommand(client *c) {
+void sinterstoreCommand(redisClient *c) {
     sinterGenericCommand(c,c->argv+2,c->argc-2,c->argv[1]);
 }
 
-#define SET_OP_UNION 0
-#define SET_OP_DIFF 1
-#define SET_OP_INTER 2
+#define REDIS_OP_UNION 0
+#define REDIS_OP_DIFF 1
+#define REDIS_OP_INTER 2
 
-void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
-                              robj *dstkey, int op) {
+void sunionDiffGenericCommand(redisClient *c, robj **setkeys, int setnum, robj *dstkey, int op) {
     robj **sets = zmalloc(sizeof(robj*)*setnum);
     setTypeIterator *si;
-    robj *dstset = NULL;
-    sds ele;
+    robj *ele, *dstset = NULL;
     int j, cardinality = 0;
     int diff_algo = 1;
 
@@ -1023,7 +749,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
             sets[j] = NULL;
             continue;
         }
-        if (checkType(c,setobj,OBJ_SET)) {
+        if (checkType(c,setobj,REDIS_SET)) {
             zfree(sets);
             return;
         }
@@ -1039,7 +765,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
      * the sets.
      *
      * We compute what is the best bet with the current input here. */
-    if (op == SET_OP_DIFF && sets[0]) {
+    if (op == REDIS_OP_DIFF && sets[0]) {
         long long algo_one_work = 0, algo_two_work = 0;
 
         for (j = 0; j < setnum; j++) {
@@ -1068,7 +794,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
      * this set object will be the resulting object to set into the target key*/
     dstset = createIntsetObject();
 
-    if (op == SET_OP_UNION) {
+    if (op == REDIS_OP_UNION) {
         /* Union is trivial, just add every element of every set to the
          * temporary set. */
         for (j = 0; j < setnum; j++) {
@@ -1077,11 +803,11 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
             si = setTypeInitIterator(sets[j]);
             while((ele = setTypeNextObject(si)) != NULL) {
                 if (setTypeAdd(dstset,ele)) cardinality++;
-                sdsfree(ele);
+                decrRefCount(ele);
             }
             setTypeReleaseIterator(si);
         }
-    } else if (op == SET_OP_DIFF && sets[0] && diff_algo == 1) {
+    } else if (op == REDIS_OP_DIFF && sets[0] && diff_algo == 1) {
         /* DIFF Algorithm 1:
          *
          * We perform the diff by iterating all the elements of the first set,
@@ -1102,10 +828,10 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
                 setTypeAdd(dstset,ele);
                 cardinality++;
             }
-            sdsfree(ele);
+            decrRefCount(ele);
         }
         setTypeReleaseIterator(si);
-    } else if (op == SET_OP_DIFF && sets[0] && diff_algo == 2) {
+    } else if (op == REDIS_OP_DIFF && sets[0] && diff_algo == 2) {
         /* DIFF Algorithm 2:
          *
          * Add all the elements of the first set to the auxiliary set.
@@ -1123,7 +849,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
                 } else {
                     if (setTypeRemove(dstset,ele)) cardinality--;
                 }
-                sdsfree(ele);
+                decrRefCount(ele);
             }
             setTypeReleaseIterator(si);
 
@@ -1135,64 +861,59 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
 
     /* Output the content of the resulting set, if not in STORE mode */
     if (!dstkey) {
-        addReplySetLen(c,cardinality);
+        addReplyMultiBulkLen(c,cardinality);
         si = setTypeInitIterator(dstset);
         while((ele = setTypeNextObject(si)) != NULL) {
-            addReplyBulkCBuffer(c,ele,sdslen(ele));
-            sdsfree(ele);
+            addReplyBulk(c,ele);
+            decrRefCount(ele);
         }
         setTypeReleaseIterator(si);
-        server.lazyfree_lazy_server_del ? freeObjAsync(NULL, dstset) :
-                                          decrRefCount(dstset);
+        decrRefCount(dstset);
     } else {
         /* If we have a target key where to store the resulting set
          * create this key with the result set inside */
+        int deleted = dbDelete(c->db,dstkey);
         if (setTypeSize(dstset) > 0) {
-            setKey(c,c->db,dstkey,dstset);
+            dbAdd(c->db,dstkey,dstset);
             addReplyLongLong(c,setTypeSize(dstset));
-            notifyKeyspaceEvent(NOTIFY_SET,
-                op == SET_OP_UNION ? "sunionstore" : "sdiffstore",
+            notifyKeyspaceEvent(REDIS_NOTIFY_SET,
+                op == REDIS_OP_UNION ? "sunionstore" : "sdiffstore",
                 dstkey,c->db->id);
-            server.dirty++;
         } else {
+            decrRefCount(dstset);
             addReply(c,shared.czero);
-            if (dbDelete(c->db,dstkey)) {
-                server.dirty++;
-                signalModifiedKey(c,c->db,dstkey);
-                notifyKeyspaceEvent(NOTIFY_GENERIC,"del",dstkey,c->db->id);
-            }
+            if (deleted)
+                notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",
+                    dstkey,c->db->id);
         }
-        decrRefCount(dstset);
+        signalModifiedKey(c->db,dstkey);
+        server.dirty++;
     }
     zfree(sets);
 }
 
-/* SUNION key [key ...] */
-void sunionCommand(client *c) {
-    sunionDiffGenericCommand(c,c->argv+1,c->argc-1,NULL,SET_OP_UNION);
+void sunionCommand(redisClient *c) {
+    sunionDiffGenericCommand(c,c->argv+1,c->argc-1,NULL,REDIS_OP_UNION);
 }
 
-/* SUNIONSTORE destination key [key ...] */
-void sunionstoreCommand(client *c) {
-    sunionDiffGenericCommand(c,c->argv+2,c->argc-2,c->argv[1],SET_OP_UNION);
+void sunionstoreCommand(redisClient *c) {
+    sunionDiffGenericCommand(c,c->argv+2,c->argc-2,c->argv[1],REDIS_OP_UNION);
 }
 
-/* SDIFF key [key ...] */
-void sdiffCommand(client *c) {
-    sunionDiffGenericCommand(c,c->argv+1,c->argc-1,NULL,SET_OP_DIFF);
+void sdiffCommand(redisClient *c) {
+    sunionDiffGenericCommand(c,c->argv+1,c->argc-1,NULL,REDIS_OP_DIFF);
 }
 
-/* SDIFFSTORE destination key [key ...] */
-void sdiffstoreCommand(client *c) {
-    sunionDiffGenericCommand(c,c->argv+2,c->argc-2,c->argv[1],SET_OP_DIFF);
+void sdiffstoreCommand(redisClient *c) {
+    sunionDiffGenericCommand(c,c->argv+2,c->argc-2,c->argv[1],REDIS_OP_DIFF);
 }
 
-void sscanCommand(client *c) {
+void sscanCommand(redisClient *c) {
     robj *set;
     unsigned long cursor;
 
-    if (parseScanCursorOrReply(c,c->argv[2],&cursor) == C_ERR) return;
+    if (parseScanCursorOrReply(c,c->argv[2],&cursor) == REDIS_ERR) return;
     if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.emptyscan)) == NULL ||
-        checkType(c,set,OBJ_SET)) return;
+        checkType(c,set,REDIS_SET)) return;
     scanGenericCommand(c,set,cursor);
 }

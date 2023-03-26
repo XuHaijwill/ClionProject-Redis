@@ -17,19 +17,13 @@ source ../support/test.tcl
 
 set ::verbose 0
 set ::valgrind 0
-set ::tls 0
 set ::pause_on_error 0
-set ::dont_clean 0
 set ::simulate_error 0
 set ::failed 0
 set ::sentinel_instances {}
 set ::redis_instances {}
-set ::global_config {}
 set ::sentinel_base_port 20000
 set ::redis_base_port 30000
-set ::redis_port_count 1024
-set ::host "127.0.0.1"
-set ::leaked_fds_file [file normalize "tmp/leaked_fds.txt"]
 set ::pids {} ; # We kill everything at exit
 set ::dirs {} ; # We remove all the temp dirs at exit
 set ::run_matching {} ; # If non empty, only tests matching pattern are run.
@@ -42,7 +36,7 @@ if {[catch {cd tmp}]} {
 
 # Execute the specified instance of the server specified by 'type', using
 # the provided configuration file. Returns the PID of the process.
-proc exec_instance {type dirname cfgfile} {
+proc exec_instance {type cfgfile} {
     if {$type eq "redis"} {
         set prgname redis-server
     } elseif {$type eq "sentinel"} {
@@ -51,21 +45,21 @@ proc exec_instance {type dirname cfgfile} {
         error "Unknown instance type."
     }
 
-    set errfile [file join $dirname err.txt]
     if {$::valgrind} {
-        set pid [exec valgrind --track-origins=yes --suppressions=../../../src/valgrind.sup --show-reachable=no --show-possibly-lost=no --leak-check=full ../../../src/${prgname} $cfgfile 2>> $errfile &]
+        set pid [exec valgrind --track-origins=yes --suppressions=../../../src/valgrind.sup --show-reachable=no --show-possibly-lost=no --leak-check=full ../../../src/${prgname} $cfgfile &]
     } else {
-        set pid [exec ../../../src/${prgname} $cfgfile 2>> $errfile &]
+        set pid [exec ../../../src/${prgname} $cfgfile &]
     }
     return $pid
 }
 
 # Spawn a redis or sentinel instance, depending on 'type'.
-proc spawn_instance {type base_port count {conf {}} {base_conf_file ""}} {
+proc spawn_instance {type base_port count {conf {}}} {
     for {set j 0} {$j < $count} {incr j} {
-        set port [find_available_port $base_port $::redis_port_count]
-        # plaintext port (only used for TLS cluster)
-        set pport 0
+        set port [find_available_port $base_port]
+        incr base_port
+        puts "Starting $type #$j at port $port"
+
         # Create a directory for this instance.
         set dirname "${type}_${j}"
         lappend ::dirs $dirname
@@ -74,82 +68,32 @@ proc spawn_instance {type base_port count {conf {}} {base_conf_file ""}} {
 
         # Write the instance config file.
         set cfgfile [file join $dirname $type.conf]
-        if {$base_conf_file ne ""} {
-            file copy -- $base_conf_file $cfgfile
-            set cfg [open $cfgfile a+]
-        } else {
-            set cfg [open $cfgfile w]
-        }
-
-        if {$::tls} {
-            puts $cfg "tls-port $port"
-            puts $cfg "tls-replication yes"
-            puts $cfg "tls-cluster yes"
-            # plaintext port, only used by plaintext clients in a TLS cluster
-            set pport [find_available_port $base_port $::redis_port_count]
-            puts $cfg "port $pport"
-            puts $cfg [format "tls-cert-file %s/../../tls/server.crt" [pwd]]
-            puts $cfg [format "tls-key-file %s/../../tls/server.key" [pwd]]
-            puts $cfg [format "tls-client-cert-file %s/../../tls/client.crt" [pwd]]
-            puts $cfg [format "tls-client-key-file %s/../../tls/client.key" [pwd]]
-            puts $cfg [format "tls-dh-params-file %s/../../tls/redis.dh" [pwd]]
-            puts $cfg [format "tls-ca-cert-file %s/../../tls/ca.crt" [pwd]]
-            puts $cfg "loglevel debug"
-        } else {
-            puts $cfg "port $port"
-        }
+        set cfg [open $cfgfile w]
+        puts $cfg "port $port"
         puts $cfg "dir ./$dirname"
         puts $cfg "logfile log.txt"
         # Add additional config files
         foreach directive $conf {
             puts $cfg $directive
         }
-        dict for {name val} $::global_config {
-            puts $cfg "$name $val"
-        }
         close $cfg
 
         # Finally exec it and remember the pid for later cleanup.
-        set retry 100
-        while {$retry} {
-            set pid [exec_instance $type $dirname $cfgfile]
+        set pid [exec_instance $type $cfgfile]
+        lappend ::pids $pid
 
-            # Check availability
-            if {[server_is_up 127.0.0.1 $port 100] == 0} {
-                puts "Starting $type #$j at port $port failed, try another"
-                incr retry -1
-                set port [find_available_port $base_port $::redis_port_count]
-                set cfg [open $cfgfile a+]
-                if {$::tls} {
-                    puts $cfg "tls-port $port"
-                    set pport [find_available_port $base_port $::redis_port_count]
-                    puts $cfg "port $pport"
-                } else {
-                    puts $cfg "port $port"
-                }
-                close $cfg
-            } else {
-                puts "Starting $type #$j at port $port"
-                lappend ::pids $pid
-                break
-            }
-        }
-
-        # Check availability finally
-        if {[server_is_up $::host $port 100] == 0} {
-            set logfile [file join $dirname log.txt]
-            puts [exec tail $logfile]
-            abort_sentinel_test "Problems starting $type #$j: ping timeout, maybe server start failed, check $logfile"
+        # Check availability
+        if {[server_is_up 127.0.0.1 $port 100] == 0} {
+            abort_sentinel_test "Problems starting $type #$j: ping timeout"
         }
 
         # Push the instance into the right list
-        set link [redis $::host $port 0 $::tls]
+        set link [redis 127.0.0.1 $port]
         $link reconnect 1
         lappend ::${type}_instances [list \
             pid $pid \
-            host $::host \
+            host 127.0.0.1 \
             port $port \
-            plaintext-port $pport \
             link $link \
         ]
     }
@@ -166,62 +110,16 @@ proc log_crashes {} {
                 puts "\n*** Crash report found in $log ***"
                 set found 1
             }
-            if {$found} {
-                puts $line
-                incr ::failed
-            }
+            if {$found} {puts $line}
         }
-    }
-
-    set logs [glob */err.txt]
-    foreach log $logs {
-        set res [find_valgrind_errors $log true]
-        if {$res != ""} {
-            puts $res
-            incr ::failed
-        }
-    }
-}
-
-proc is_alive pid {
-    if {[catch {exec ps -p $pid} err]} {
-        return 0
-    } else {
-        return 1
-    }
-}
-
-proc stop_instance pid {
-    catch {exec kill $pid}
-    # Node might have been stopped in the test
-    catch {exec kill -SIGCONT $pid}
-    if {$::valgrind} {
-        set max_wait 60000
-    } else {
-        set max_wait 10000
-    }
-    while {[is_alive $pid]} {
-        incr wait 10
-
-        if {$wait >= $max_wait} {
-            puts "Forcing process $pid to exit..."
-            catch {exec kill -KILL $pid}
-        } elseif {$wait % 1000 == 0} {
-            puts "Waiting for process $pid to exit..."
-        }
-        after 10
     }
 }
 
 proc cleanup {} {
     puts "Cleaning up..."
-    foreach pid $::pids {
-        puts "killing stale instance $pid"
-        stop_instance $pid
-    }
     log_crashes
-    if {$::dont_clean} {
-        return
+    foreach pid $::pids {
+        catch {exec kill -9 $pid}
     }
     foreach dir $::dirs {
         catch {exec rm -rf $dir}
@@ -246,35 +144,16 @@ proc parse_options {} {
             set ::run_matching "*${val}*"
         } elseif {$opt eq "--pause-on-error"} {
             set ::pause_on_error 1
-        } elseif {$opt eq {--dont-clean}} {
-            set ::dont_clean 1
         } elseif {$opt eq "--fail"} {
             set ::simulate_error 1
         } elseif {$opt eq {--valgrind}} {
             set ::valgrind 1
-        } elseif {$opt eq {--host}} {
-            incr j
-            set ::host ${val}
-        } elseif {$opt eq {--tls}} {
-            package require tls 1.6
-            ::tls::init \
-                -cafile "$::tlsdir/ca.crt" \
-                -certfile "$::tlsdir/client.crt" \
-                -keyfile "$::tlsdir/client.key"
-            set ::tls 1
-        } elseif {$opt eq {--config}} {
-            set val2 [lindex $::argv [expr $j+2]]
-            dict set ::global_config $val $val2
-            incr j 2
         } elseif {$opt eq "--help"} {
+            puts "Hello, I'm sentinel.tcl and I run Sentinel unit tests."
+            puts "\nOptions:"
             puts "--single <pattern>      Only runs tests specified by pattern."
-            puts "--dont-clean            Keep log files on exit."
             puts "--pause-on-error        Pause for manual inspection on error."
             puts "--fail                  Simulate a test failure."
-            puts "--valgrind              Run with valgrind."
-            puts "--tls                   Run tests in TLS mode."
-            puts "--host <host>           Use hostname instead of 127.0.0.1."
-            puts "--config <k> <v>        Extra config argument(s)."
             puts "--help                  Shows this help."
             exit 0
         } else {
@@ -354,7 +233,7 @@ proc pause_on_error {} {
             puts "S <id> cmd ... arg     Call command in Sentinel <id>."
             puts "R <id> cmd ... arg     Call command in Redis <id>."
             puts "SI <id> <field>        Show Sentinel <id> INFO <field>."
-            puts "RI <id> <field>        Show Redis <id> INFO <field>."
+            puts "RI <id> <field>        Show Sentinel <id> INFO <field>."
             puts "continue               Resume test."
         } else {
             set errcode [catch {eval $line} retval]
@@ -422,11 +301,6 @@ proc check_leaks instance_types {
 proc run_tests {} {
     set tests [lsort [glob ../tests/*]]
     foreach test $tests {
-        # Remove leaked_fds file before starting
-        if {$::leaked_fds_file != "" && [file exists $::leaked_fds_file]} {
-            file delete $::leaked_fds_file
-        }
-
         if {$::run_matching ne {} && [string match $::run_matching $test] == 0} {
             continue
         }
@@ -434,24 +308,16 @@ proc run_tests {} {
         puts [colorstr yellow "Testing unit: [lindex [file split $test] end]"]
         source $test
         check_leaks {redis sentinel}
-
-        # Check if a leaked fds file was created and abort the test.
-        if {$::leaked_fds_file != "" && [file exists $::leaked_fds_file]} {
-            puts [colorstr red "ERROR: Sentinel has leaked fds to scripts:"]
-            puts [exec cat $::leaked_fds_file]
-            puts "----"
-            incr ::failed
-        }
     }
 }
 
 # Print a message and exists with 0 / 1 according to zero or more failures.
 proc end_tests {} {
-    if {$::failed == 0 } {
+    if {$::failed == 0} {
         puts "GOOD! No errors."
         exit 0
     } else {
-        puts "WARNING $::failed test(s) failed."
+        puts "WARNING $::failed tests faield."
         exit 1
     }
 }
@@ -467,16 +333,10 @@ proc S {n args} {
     [dict get $s link] {*}$args
 }
 
-# Returns a Redis instance by index.
-# Example:
-#     [Rn 0] info
-proc Rn {n} {
-    return [dict get [lindex $::redis_instances $n] link]
-}
-
 # Like R but to chat with Redis instances.
 proc R {n args} {
-    [Rn $n] {*}$args
+    set r [lindex $::redis_instances $n]
+    [dict get $r link] {*}$args
 }
 
 proc get_info_field {info field} {
@@ -497,14 +357,6 @@ proc SI {n field} {
 
 proc RI {n field} {
     get_info_field [R $n info] $field
-}
-
-proc RPort {n} {
-    if {$::tls} {
-        return [lindex [R $n config get tls-port] 1]
-    } else {
-        return [lindex [R $n config get port] 1]
-    }
 }
 
 # Iterate over IDs of sentinel or redis instances.
@@ -594,7 +446,7 @@ proc kill_instance {type id} {
         error "You tried to kill $type $id twice."
     }
 
-    stop_instance $pid
+    exec kill -9 $pid
     set_instance_attrib $type $id pid -1
     set_instance_attrib $type $id link you_tried_to_talk_with_killed_instance
 
@@ -603,12 +455,12 @@ proc kill_instance {type id} {
 
     # Wait for the port it was using to be available again, so that's not
     # an issue to start a new server ASAP with the same port.
-    set retry 100
+    set retry 10
     while {[incr retry -1]} {
-        set port_is_free [catch {set s [socket 127.0.0.1 $port]}]
+        set port_is_free [catch {set s [socket 127.0.01 $port]}]
         if {$port_is_free} break
         catch {close $s}
-        after 100
+        after 1000
     }
     if {$retry == 0} {
         error "Port $port does not return available after killing instance."
@@ -629,19 +481,17 @@ proc restart_instance {type id} {
 
     # Execute the instance with its old setup and append the new pid
     # file for cleanup.
-    set pid [exec_instance $type $dirname $cfgfile]
+    set pid [exec_instance $type $cfgfile]
     set_instance_attrib $type $id pid $pid
     lappend ::pids $pid
 
     # Check that the instance is running
     if {[server_is_up 127.0.0.1 $port 100] == 0} {
-        set logfile [file join $dirname log.txt]
-        puts [exec tail $logfile]
-        abort_sentinel_test "Problems starting $type #$id: ping timeout, maybe server start failed, check $logfile"
+        abort_sentinel_test "Problems starting $type #$id: ping timeout"
     }
 
     # Connect with it with a fresh link
-    set link [redis 127.0.0.1 $port 0 $::tls]
+    set link [redis 127.0.0.1 $port]
     $link reconnect 1
     set_instance_attrib $type $id link $link
 
@@ -658,16 +508,3 @@ proc restart_instance {type id} {
     }
 }
 
-proc redis_deferring_client {type id} {
-    set port [get_instance_attrib $type $id port]
-    set host [get_instance_attrib $type $id host]
-    set client [redis $host $port 1 $::tls]
-    return $client
-}
-
-proc redis_client {type id} {
-    set port [get_instance_attrib $type $id port]
-    set host [get_instance_attrib $type $id host]
-    set client [redis $host $port 0 $::tls]
-    return $client
-}

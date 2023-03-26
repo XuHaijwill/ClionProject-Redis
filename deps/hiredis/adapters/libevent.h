@@ -30,117 +30,52 @@
 
 #ifndef __HIREDIS_LIBEVENT_H__
 #define __HIREDIS_LIBEVENT_H__
-#include <event2/event.h>
+#include <event.h>
 #include "../hiredis.h"
 #include "../async.h"
 
-#define REDIS_LIBEVENT_DELETED 0x01
-#define REDIS_LIBEVENT_ENTERED 0x02
-
 typedef struct redisLibeventEvents {
     redisAsyncContext *context;
-    struct event *ev;
-    struct event_base *base;
-    struct timeval tv;
-    short flags;
-    short state;
+    struct event rev, wev;
 } redisLibeventEvents;
 
-static void redisLibeventDestroy(redisLibeventEvents *e) {
-    hi_free(e);
-}
-
-static void redisLibeventHandler(int fd, short event, void *arg) {
-    ((void)fd);
+static void redisLibeventReadEvent(int fd, short event, void *arg) {
+    ((void)fd); ((void)event);
     redisLibeventEvents *e = (redisLibeventEvents*)arg;
-    e->state |= REDIS_LIBEVENT_ENTERED;
-
-    #define CHECK_DELETED() if (e->state & REDIS_LIBEVENT_DELETED) {\
-        redisLibeventDestroy(e);\
-        return; \
-    }
-
-    if ((event & EV_TIMEOUT) && (e->state & REDIS_LIBEVENT_DELETED) == 0) {
-        redisAsyncHandleTimeout(e->context);
-        CHECK_DELETED();
-    }
-
-    if ((event & EV_READ) && e->context && (e->state & REDIS_LIBEVENT_DELETED) == 0) {
-        redisAsyncHandleRead(e->context);
-        CHECK_DELETED();
-    }
-
-    if ((event & EV_WRITE) && e->context && (e->state & REDIS_LIBEVENT_DELETED) == 0) {
-        redisAsyncHandleWrite(e->context);
-        CHECK_DELETED();
-    }
-
-    e->state &= ~REDIS_LIBEVENT_ENTERED;
-    #undef CHECK_DELETED
+    redisAsyncHandleRead(e->context);
 }
 
-static void redisLibeventUpdate(void *privdata, short flag, int isRemove) {
-    redisLibeventEvents *e = (redisLibeventEvents *)privdata;
-    const struct timeval *tv = e->tv.tv_sec || e->tv.tv_usec ? &e->tv : NULL;
-
-    if (isRemove) {
-        if ((e->flags & flag) == 0) {
-            return;
-        } else {
-            e->flags &= ~flag;
-        }
-    } else {
-        if (e->flags & flag) {
-            return;
-        } else {
-            e->flags |= flag;
-        }
-    }
-
-    event_del(e->ev);
-    event_assign(e->ev, e->base, e->context->c.fd, e->flags | EV_PERSIST,
-                 redisLibeventHandler, privdata);
-    event_add(e->ev, tv);
+static void redisLibeventWriteEvent(int fd, short event, void *arg) {
+    ((void)fd); ((void)event);
+    redisLibeventEvents *e = (redisLibeventEvents*)arg;
+    redisAsyncHandleWrite(e->context);
 }
 
 static void redisLibeventAddRead(void *privdata) {
-    redisLibeventUpdate(privdata, EV_READ, 0);
+    redisLibeventEvents *e = (redisLibeventEvents*)privdata;
+    event_add(&e->rev,NULL);
 }
 
 static void redisLibeventDelRead(void *privdata) {
-    redisLibeventUpdate(privdata, EV_READ, 1);
+    redisLibeventEvents *e = (redisLibeventEvents*)privdata;
+    event_del(&e->rev);
 }
 
 static void redisLibeventAddWrite(void *privdata) {
-    redisLibeventUpdate(privdata, EV_WRITE, 0);
+    redisLibeventEvents *e = (redisLibeventEvents*)privdata;
+    event_add(&e->wev,NULL);
 }
 
 static void redisLibeventDelWrite(void *privdata) {
-    redisLibeventUpdate(privdata, EV_WRITE, 1);
+    redisLibeventEvents *e = (redisLibeventEvents*)privdata;
+    event_del(&e->wev);
 }
 
 static void redisLibeventCleanup(void *privdata) {
     redisLibeventEvents *e = (redisLibeventEvents*)privdata;
-    if (!e) {
-        return;
-    }
-    event_del(e->ev);
-    event_free(e->ev);
-    e->ev = NULL;
-
-    if (e->state & REDIS_LIBEVENT_ENTERED) {
-        e->state |= REDIS_LIBEVENT_DELETED;
-    } else {
-        redisLibeventDestroy(e);
-    }
-}
-
-static void redisLibeventSetTimeout(void *privdata, struct timeval tv) {
-    redisLibeventEvents *e = (redisLibeventEvents *)privdata;
-    short flags = e->flags;
-    e->flags = 0;
-    e->tv = tv;
-    redisLibeventUpdate(e, flags, 0);
+    event_del(&e->rev);
+    event_del(&e->wev);
+    free(e);
 }
 
 static int redisLibeventAttach(redisAsyncContext *ac, struct event_base *base) {
@@ -152,10 +87,7 @@ static int redisLibeventAttach(redisAsyncContext *ac, struct event_base *base) {
         return REDIS_ERR;
 
     /* Create container for context and r/w events */
-    e = (redisLibeventEvents*)hi_calloc(1, sizeof(*e));
-    if (e == NULL)
-        return REDIS_ERR;
-
+    e = (redisLibeventEvents*)malloc(sizeof(*e));
     e->context = ac;
 
     /* Register functions to start/stop listening for events */
@@ -164,12 +96,13 @@ static int redisLibeventAttach(redisAsyncContext *ac, struct event_base *base) {
     ac->ev.addWrite = redisLibeventAddWrite;
     ac->ev.delWrite = redisLibeventDelWrite;
     ac->ev.cleanup = redisLibeventCleanup;
-    ac->ev.scheduleTimer = redisLibeventSetTimeout;
     ac->ev.data = e;
 
     /* Initialize and install read/write events */
-    e->ev = event_new(base, c->fd, EV_READ | EV_WRITE, redisLibeventHandler, e);
-    e->base = base;
+    event_set(&e->rev,c->fd,EV_READ,redisLibeventReadEvent,e);
+    event_set(&e->wev,c->fd,EV_WRITE,redisLibeventWriteEvent,e);
+    event_base_set(base,&e->rev);
+    event_base_set(base,&e->wev);
     return REDIS_OK;
 }
 #endif

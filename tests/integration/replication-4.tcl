@@ -1,4 +1,13 @@
-start_server {tags {"repl network"}} {
+proc start_bg_complex_data {host port db ops} {
+    set tclsh [info nameofexecutable]
+    exec $tclsh tests/helpers/bg_complex_data.tcl $host $port $db $ops &
+}
+
+proc stop_bg_complex_data {handle} {
+    catch {exec /bin/kill -9 $handle}
+}
+
+start_server {tags {"repl"}} {
     start_server {} {
 
         set master [srv -1 client]
@@ -16,14 +25,20 @@ start_server {tags {"repl network"}} {
             s 0 role
         } {slave}
 
-        test {Test replication with parallel clients writing in different DBs} {
+        test {Test replication with parallel clients writing in differnet DBs} {
             after 5000
             stop_bg_complex_data $load_handle0
             stop_bg_complex_data $load_handle1
             stop_bg_complex_data $load_handle2
-            wait_for_condition 100 100 {
-                [$master debug digest] == [$slave debug digest]
-            } else {
+            set retry 10
+            while {$retry && ([$master debug digest] ne [$slave debug digest])}\
+            {
+                after 1000
+                incr retry -1
+            }
+            assert {[$master dbsize] > 0}
+
+            if {[$master debug digest] ne [$slave debug digest]} {
                 set csv1 [csvdump r]
                 set csv2 [csvdump {r -1}]
                 set fd [open /tmp/repldump1.txt w]
@@ -32,9 +47,10 @@ start_server {tags {"repl network"}} {
                 set fd [open /tmp/repldump2.txt w]
                 puts -nonewline $fd $csv2
                 close $fd
-                fail "Master - Replica inconsistency, Run diff -u against /tmp/repldump*.txt for more info"
+                puts "Master - Slave inconsistency"
+                puts "Run diff -u against /tmp/repldump*.txt for more info"
             }
-            assert {[$master dbsize] > 0}
+            assert_equal [r debug digest] [r -1 debug digest]
         }
     }
 }
@@ -58,43 +74,26 @@ start_server {tags {"repl"}} {
         test {With min-slaves-to-write (1,3): master should be writable} {
             $master config set min-slaves-max-lag 3
             $master config set min-slaves-to-write 1
-            assert_equal OK [$master set foo 123]
-            assert_equal OK [$master eval "return redis.call('set','foo',12345)" 0]
-        }
+            $master set foo bar
+        } {OK}
 
         test {With min-slaves-to-write (2,3): master should not be writable} {
             $master config set min-slaves-max-lag 3
             $master config set min-slaves-to-write 2
-            assert_error "*NOREPLICAS*" {$master set foo bar}
-            assert_error "*NOREPLICAS*" {$master eval "redis.call('set','foo','bar')" 0}
-        }
-
-        test {With not enough good slaves, read in Lua script is still accepted} {
-            $master config set min-slaves-max-lag 3
-            $master config set min-slaves-to-write 1
-            $master eval "redis.call('set','foo','bar')" 0
-
-            $master config set min-slaves-to-write 2
-            $master eval "return redis.call('get','foo')" 0
-        } {bar}
+            catch {$master set foo bar} e
+            set e
+        } {NOREPLICAS*}
 
         test {With min-slaves-to-write: master not writable with lagged slave} {
             $master config set min-slaves-max-lag 2
             $master config set min-slaves-to-write 1
-            assert_equal OK [$master set foo 123]
-            assert_equal OK [$master eval "return redis.call('set','foo',12345)" 0]
-            # Killing a slave to make it become a lagged slave.
-            exec kill -SIGSTOP [srv 0 pid]
-            # Waiting for slave kill.
-            wait_for_condition 100 100 {
-                [catch {$master set foo 123}] != 0
-            } else {
-                fail "Master didn't become readonly"
-            }
-            assert_error "*NOREPLICAS*" {$master set foo 123}
-            assert_error "*NOREPLICAS*" {$master eval "return redis.call('set','foo',12345)" 0}
-            exec kill -SIGCONT [srv 0 pid]
-        }
+            assert {[$master set foo bar] eq {OK}}
+            $slave deferred 1
+            $slave debug sleep 6
+            after 4000
+            catch {$master set foo bar} e
+            set e
+        } {NOREPLICAS*}
     }
 }
 
@@ -132,25 +131,6 @@ start_server {tags {"repl"}} {
                 incr retry -1
             }
             assert {[$master dbsize] > 0}
-        }
-
-        test {Replication of SPOP command -- alsoPropagate() API} {
-            $master del myset
-            set size [expr 1+[randomInt 100]]
-            set content {}
-            for {set j 0} {$j < $size} {incr j} {
-                lappend content [randomValue]
-            }
-            $master sadd myset {*}$content
-
-            set count [randomInt 100]
-            set result [$master spop myset $count]
-
-            wait_for_condition 50 100 {
-                [$master debug digest] eq [$slave debug digest]
-            } else {
-                fail "SPOP replication inconsistency"
-            }
         }
     }
 }

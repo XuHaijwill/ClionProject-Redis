@@ -96,7 +96,7 @@ static void redisAeCleanup(void *privdata) {
     redisAeEvents *e = (redisAeEvents*)privdata;
     redisAeDelRead(privdata);
     redisAeDelWrite(privdata);
-    hi_free(e);
+    free(e);
 }
 
 static int redisAeAttach(aeEventLoop *loop, redisAsyncContext *ac) {
@@ -108,10 +108,7 @@ static int redisAeAttach(aeEventLoop *loop, redisAsyncContext *ac) {
         return REDIS_ERR;
 
     /* Create container for context and r/w events */
-    e = (redisAeEvents*)hi_malloc(sizeof(*e));
-    if (e == NULL)
-        return REDIS_ERR;
-
+    e = (redisAeEvents*)malloc(sizeof(*e));
     e->context = ac;
     e->loop = loop;
     e->fd = c->fd;

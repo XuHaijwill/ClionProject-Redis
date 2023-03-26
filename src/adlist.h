@@ -66,13 +66,12 @@ typedef struct list {
 #define listSetMatchMethod(l,m) ((l)->match = (m))
 
 #define listGetDupMethod(l) ((l)->dup)
-#define listGetFreeMethod(l) ((l)->free)
+#define listGetFree(l) ((l)->free)
 #define listGetMatchMethod(l) ((l)->match)
 
 /* Prototypes */
 list *listCreate(void);
 void listRelease(list *list);
-void listEmpty(list *list);
 list *listAddNodeHead(list *list, void *value);
 list *listAddNodeTail(list *list, void *value);
 list *listInsertNode(list *list, listNode *old_node, void *value, int after);
@@ -85,9 +84,7 @@ listNode *listSearchKey(list *list, void *key);
 listNode *listIndex(list *list, long index);
 void listRewind(list *list, listIter *li);
 void listRewindTail(list *list, listIter *li);
-void listRotateTailToHead(list *list);
-void listRotateHeadToTail(list *list);
-void listJoin(list *l, list *o);
+void listRotate(list *list);
 
 /* Directions for iterators */
 #define AL_START_HEAD 0

@@ -32,10 +32,9 @@ set(LUA_SRC
         src/ldebug.c
         src/lparser.c
         src/lua_cjson.c
-        src/fpconv.c
-        src/lua_bit.c
         src/llex.c
         src/ltm.c
         src/ldo.c
         )
+
 add_library(lua STATIC ${LUA_SRC})
