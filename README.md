@@ -1,4 +1,4 @@
-# 调试连接工具
+# 连接工具
 https://github.com/XuHaijwill/AnotherRedisDesktopManager
 
 # Redis
